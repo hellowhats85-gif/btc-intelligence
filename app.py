@@ -2,7 +2,9 @@ import streamlit as st
 import pandas as pd
 import time, json, threading, websocket, requests
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import math
 
 st.set_page_config(page_title='BTC Order Flow', layout='wide')
 class Feed:
@@ -55,6 +57,20 @@ def markets():
 st.title('₿ BTC Order Flow Terminal')
 st.caption('Live exchange executions • research only • not official BRTI')
 w=st.sidebar.selectbox('Rolling window (seconds)',[10,30,60,300,900,3600],index=2)
+st.sidebar.header('Kalshi target')
+target=st.sidebar.number_input('Target BTC price ($)',min_value=0.0,value=0.0,step=0.01,format='%.2f',help='Enter the exact price to beat from Kalshi.')
+local=ZoneInfo('America/Chicago')
+mode=st.sidebar.radio('Expiration mode',['15-minute boundary','Hourly boundary','Custom (Central time)'])
+now_local=datetime.now(local)
+if mode=='Custom (Central time)':
+    day=st.sidebar.date_input('Expiration date',now_local.date())
+    clock=st.sidebar.time_input('Expiration time (CT)',(now_local+timedelta(minutes=15)).time().replace(second=0,microsecond=0),step=60)
+    expiry=datetime.combine(day,clock,tzinfo=local)
+else:
+    minutes=15 if mode=='15-minute boundary' else 60
+    boundary=(int(time.time())//(minutes*60)+1)*minutes*60
+    expiry=datetime.fromtimestamp(boundary,local)
+# Fixed on full rerun, not on the one-second fragment refresh.
 @st.fragment(run_every=1)
 def dashboard():
     now=time.time()
@@ -74,6 +90,30 @@ def dashboard():
     st.progress(float(share),text=f'Buy aggression {share:.1%} | Sell aggression {1-share:.1%}')
     moves=d.groupby('exchange').price.agg(['first','last']); change=((moves['last']/moves['first']-1)*100).median()
     bias='BUYER PRESSURE' if share>=.60 and change>0 else 'SELLER PRESSURE' if share<=.40 and change<0 else 'MIXED / POSSIBLE ABSORPTION'
+    st.subheader('Target price monitor')
+    remaining=expiry.timestamp()-now
+    latest=d.groupby('exchange').tail(1)
+    latest=latest[latest.time>=now-15]
+    proxy=float(latest.price.median()) if len(latest)==2 else None
+    c=st.columns(3)
+    c[0].metric('Target',f'${target:,.2f}' if target else 'Set target in sidebar')
+    c[1].metric('Time remaining',f'{int(max(0,remaining))//60:02d}:{int(max(0,remaining))%60:02d}')
+    c[2].metric('Live spot proxy',f'${proxy:,.2f}' if proxy is not None else 'Unavailable')
+    st.caption(f'Expiration: {expiry:%Y-%m-%d %I:%M %p %Z} | two-exchange median, NOT official BRTI')
+    if target and proxy is not None and remaining>0:
+        distance=proxy-target
+        st.metric('Distance from target',f'${distance:+,.2f}',f'{distance/target:+.3%}')
+        # Illustrative constant log-price drift projection, not a probability.
+        if ready and all(moves['first']>0) and len(moves)==2:
+            drift=float((moves['last']/moves['first']).map(math.log).median())/w
+            projected=proxy*math.exp(max(-0.1,min(0.1,drift*remaining)))
+            label='ABOVE / UP' if projected>target else 'BELOW / DOWN' if projected<target else 'AT TARGET'
+            st.subheader('Scenario: '+label)
+            st.metric('Constant-trend scenario at expiry',f'${projected:,.2f}')
+            st.caption('Unvalidated extrapolation of recent price movement, capped at ±0.1 log return. Not a probability or settlement forecast. Order-flow pressure is shown separately.')
+        else: st.info('Waiting for complete live window before showing a directional scenario.')
+    elif remaining<=0: st.warning('Expiration passed. Set a new target or expiration. Official settlement is not available here.')
+    elif not target: st.info('Enter the Kalshi price to beat in the sidebar.')
     st.subheader(bias if ready else 'WAITING FOR FULL WINDOW'); st.caption(f'Median venue price change: {change:+.3f}% • heuristic, not calibrated prediction')
     d['utc']=pd.to_datetime(d.time,unit='s',utc=True); d['bucket']=d.utc.dt.floor('5s'); d['signed']=d.usd.where(d.side=='buy',-d.usd)
     st.bar_chart(d.pivot_table(index='bucket',columns='side',values='usd',aggfunc='sum',fill_value=0),color=['#16a34a','#ef4444'] if set(d.side)=={'buy','sell'} else None)
