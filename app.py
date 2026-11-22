@@ -141,8 +141,19 @@ def dashboard():
         if signals:
             st.subheader('Multi-timeframe chart analysis')
             st.dataframe(pd.DataFrame([{'Timeframe':f'{m}m','Bias':'Bullish' if v['score']>0.15 else 'Bearish' if v['score']<-.15 else 'Mixed',**{k:round(v[k],3) for k in ('RSI','MACD','VWAP','EMA9','EMA21','EMA50','EMA200','support','resistance','lower','upper','ATR','ADX','relative_volume','momentum')},'Regime':v['regime']} for m,v in signals.items()]),hide_index=True)
-        valid=all(m in signals and now-signals[m]['last_time']<=(m*60*2+60) for m in (1,5,15,60))
-        if ready and all(now-started.get(x,now)>=60 for x in f.trades) and valid and now-bt<15 and book['buy'] and book['sell']:
+        check_time=time.time()
+        checks={}
+        for m in (1,5,15,60):
+            age=check_time-signals[m]['last_time'] if m in signals else float('inf')
+            checks[f'{m}m chart']=(m in signals and 0<=age<=m*120+60, f'Age {age:.0f}s' if m in signals else 'Missing chart')
+        for x in f.trades:
+            age=now-last.get(x,0); warm=max(0,now-started.get(x,now))
+            checks[x]=(status.get(x)=='Connected' and age<15 and warm>=max(w,60), f'{status.get(x,"Connecting")} | message age {age:.1f}s | collection {warm:.0f}/{max(w,60)}s')
+        checks['Coinbase order book']=(bool(book['buy'] and book['sell']) and now-bt<15, f'Age {now-bt:.1f}s' if bt else 'No snapshot received')
+        with st.expander('Prediction readiness — connection diagnostics',expanded=not all(v[0] for v in checks.values())):
+            for name,(ok,detail) in checks.items():
+                st.write(f'{"PASS" if ok else "WAIT"} | {name}: {detail}')
+        if all(v[0] for v in checks.values()):
             mid=(max(book['buy'])+min(book['sell']))/2
             bidv=sum(p*q for p,q in book['buy'].items() if p>=mid*.999); askv=sum(p*q for p,q in book['sell'].items() if p<=mid*1.001)
             flow=2*share-1; imbalance=(bidv-askv)/(bidv+askv) if bidv+askv else 0
@@ -165,7 +176,7 @@ def dashboard():
             if abs(margin)<.75 or chartscore*flowscore<-.10: st.warning('NO TRADE research signal: weak target separation or conflicting evidence.')
             if remaining<=60: st.warning('Final settlement averaging window: the scenario does not incorporate elapsed averaging observations; especially uncertain.')
             st.caption('Unvalidated heuristic, not a win probability. Weights: 55% chart signals, 35% aggressive volume, 10% resting liquidity. Price scenario uses the reference displayed above, not a verified settlement average.')
-        else: st.info('Final estimate withheld: waiting for all four fresh charts, full live trade window and fresh order book.')
+        else: st.info('Final estimate withheld. See readiness diagnostics above for the exact missing requirements.')
     elif remaining<=0: st.warning('Expiration passed. Set a new target or expiration. Official settlement is not available here.')
     elif not target: st.info('Enter the Kalshi price to beat in the sidebar.')
     st.subheader(bias if ready else 'WAITING FOR FULL WINDOW'); st.caption(f'Median venue price change: {change:+.3f}% • heuristic, not calibrated prediction')
