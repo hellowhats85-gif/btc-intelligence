@@ -5,19 +5,72 @@ from collections import deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import math
+from concurrent.futures import ThreadPoolExecutor
 from brti import BRTI
 from pro import Trainer, snapshot, heatmap, features
 import plotly.graph_objects as go
 from engine import candles, advanced, advanced_forecast
 from intelligence import simulation, footprint, log_forecast, history, settle
 
-@st.cache_data(ttl=30)
-def chart_signals():
-    result={}
-    for m in (1,5,15,60):
-        try: result[m]=advanced(candles(m))
-        except Exception: pass
+def fetch_chart(m, venue, feed):
+    end=int(time.time()//(m*60))*m*60
+    if venue=='Kraken':
+        r=requests.get('https://api.kraken.com/0/public/OHLC',params={'pair':'XBTUSD','interval':m},timeout=6); r.raise_for_status()
+        j=r.json()
+        if j.get('error'): raise ValueError(str(j['error']))
+        rows=next(v for k,v in j['result'].items() if k!='last')
+        d=pd.DataFrame(rows,columns=['time','open','high','low','close','vwap','volume','count'])[['time','low','high','open','close','volume']]
+    else:
+        iso=lambda t: datetime.fromtimestamp(t,timezone.utc).isoformat()
+        r=requests.get('https://api.exchange.coinbase.com/products/BTC-USD/candles',params={'granularity':m*60,'start':iso(end-299*m*60),'end':iso(end)},timeout=6); r.raise_for_status()
+        d=pd.DataFrame(r.json(),columns=['time','low','high','open','close','volume'])
+    d=d.apply(pd.to_numeric,errors='raise').sort_values('time').drop_duplicates('time')
+    d=d[d.time<end]
+    # Merge only complete live intervals after uninterrupted feed start.
+    with feed.lock:
+        start=feed.started.get(venue,time.time())
+        live=feed.status.get(venue)=='Connected' and time.time()-feed.last.get(venue,0)<15
+        trades=[r for r in feed.trades[venue] if r[0]>=start and r[0]<end]
+    if live and trades:
+        d=merge_live(d,trades,start,end,m)
+    groups=d.time.diff().ne(m*60).cumsum()
+    if d.empty: raise ValueError('No closed candles')
+    d=d[groups==groups.iloc[-1]].reset_index(drop=True)
+    result=advanced(d); result['source']=venue
     return result
+
+from live_candles import merge_live
+
+class ChartWorker:
+    def __init__(self, feed):
+        self.feed=feed
+        self.lock=threading.Lock(); self.results={}; self.errors={}
+        threading.Thread(target=self.run,daemon=True).start()
+    def run(self):
+        while True:
+            def job(pair):
+                m,v=pair
+                try: return m,v,fetch_chart(m,v,self.feed),None
+                except Exception as e: return m,v,None,str(e)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                batch=list(pool.map(job,[(m,v) for m in (1,5,15,60) for v in ('Coinbase','Kraken')]))
+            with self.lock:
+                for m,v,r,e in batch:
+                    if r is not None: self.results[m,v]=r
+                    self.errors[m,v]=e
+            time.sleep(15)
+    def read(self):
+        with self.lock:
+            out={}
+            for m in (1,5,15,60):
+                candidates=[r for (k,v),r in self.results.items() if k==m]
+                if candidates: out[m]=max(candidates,key=lambda r:r['last_time'])
+            return out
+
+@st.cache_resource
+def chart_worker(_feed): return ChartWorker(_feed)
+
+def chart_signals(feed): return chart_worker(feed).read()
 
 st.set_page_config(page_title='BTC Intelligence X Pro', layout='wide')
 class Feed:
@@ -59,6 +112,7 @@ class Feed:
 @st.cache_resource
 def feed(): return Feed()
 f=feed()
+chart_worker(f)
 @st.cache_resource
 def brti_feed():
     try:
@@ -77,7 +131,7 @@ def markets():
 st.title('₿ BTC Intelligence X Pro')
 @st.cache_resource
 def trainer(): return Trainer()
-ml=trainer()
+ml=trainer() if False else None
 page=st.sidebar.radio('Workspace',['Live terminal','Performance lab','Machine learning lab','Liquidity history'])
 st.caption('Live exchange executions • research only • optional authenticated BRTI')
 w=st.sidebar.selectbox('Rolling window (seconds)',[10,30,60,300,900,3600],index=2)
@@ -137,15 +191,15 @@ def dashboard():
     if target and proxy is not None and remaining>0:
         distance=proxy-target
         st.metric('Distance from target',f'${distance:+,.2f}',f'{distance/target:+.3%}')
-        signals=chart_signals()
+        signals=chart_signals(f)
         if signals:
             st.subheader('Multi-timeframe chart analysis')
             st.dataframe(pd.DataFrame([{'Timeframe':f'{m}m','Bias':'Bullish' if v['score']>0.15 else 'Bearish' if v['score']<-.15 else 'Mixed',**{k:round(v[k],3) for k in ('RSI','MACD','VWAP','EMA9','EMA21','EMA50','EMA200','support','resistance','lower','upper','ATR','ADX','relative_volume','momentum')},'Regime':v['regime']} for m,v in signals.items()]),hide_index=True)
         check_time=time.time()
         checks={}
         for m in (1,5,15,60):
-            age=check_time-signals[m]['last_time'] if m in signals else float('inf')
-            checks[f'{m}m chart']=(m in signals and 0<=age<=m*120+60, f'Age {age:.0f}s' if m in signals else 'Missing chart')
+            age=check_time-(signals[m]['last_time']+m*60) if m in signals else float('inf')
+            checks[f'{m}m chart']=(m in signals and 0<=age<=m*60+60, f"{signals[m]['source']} | closed candle age {age:.0f}s" if m in signals else 'Missing chart')
         for x in f.trades:
             age=now-last.get(x,0); warm=max(0,now-started.get(x,now))
             checks[x]=(status.get(x)=='Connected' and age<15 and warm>=max(w,60), f'{status.get(x,"Connecting")} | message age {age:.1f}s | collection {warm:.0f}/{max(w,60)}s')
@@ -195,14 +249,17 @@ def dashboard():
         st.dataframe(pd.DataFrame([{'side':side,'price':p,'USD':p*q} for side,levels in book.items() for p,q in sorted(levels.items(),key=lambda z:abs(z[0]-mid))[:25]]),hide_index=True)
         st.metric('Coinbase midpoint',f'${mid:,.2f}'); st.write(f'Within 0.1%: bids ${buys:,.0f} | asks ${sells:,.0f}'); st.caption('Resting orders can be cancelled. Midpoint is NOT BRTI.')
     else: st.info('Order book unavailable or stale.')
-    st.subheader('Kalshi market context'); ms=markets()
+    st.subheader('Kalshi market context'); ms=st.session_state.get("market_cache", [])
+    if st.button("Refresh Kalshi markets"):
+        ms=markets(); st.session_state["market_cache"]=ms
     if ms:
         st.dataframe(pd.DataFrame([{k:m.get(k) for k in ['ticker','title','close_time','floor_strike','yes_bid_dollars','yes_ask_dollars']} for m in ms]),hide_index=True)
     else: st.info('Kalshi public market metadata unavailable.')
-    st.caption('Official BRTI feed not connected. Check official settlement reference separately. Directional heuristic only; no official settlement prediction or trading execution.')
+    st.caption("Research only; verify official settlement separately. No trading execution.")
 if page=='Live terminal':
     dashboard()
 elif page=='Machine learning lab':
+    ml=trainer()
     st.header('Machine learning lab'); st.write(ml.status)
     st.caption('Seven days of Coinbase candles; six-hour retraining while server runs. Purged chronological holdout. Models predict future close direction, not Kalshi settlement.')
     for h,(models,metrics) in ml.models.items():
